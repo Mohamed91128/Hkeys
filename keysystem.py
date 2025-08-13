@@ -8,6 +8,7 @@ from cryptography.fernet import Fernet
 app = Flask(__name__)
 
 KEYS_FILE = "keys.json"
+USAGE_FILE = "usage.json"  # to track daily usage per user IP
 ENCRYPTION_KEY = b"hQ4S1jT1TfQcQk_XLhJ7Ky1n3ht9ABhxqYUt09Ax0CM="
 cipher = Fernet(ENCRYPTION_KEY)
 
@@ -21,20 +22,60 @@ def save_keys(keys):
     with open(KEYS_FILE, 'w') as f:
         json.dump(keys, f)
 
+def load_usage():
+    if not os.path.exists(USAGE_FILE):
+        return {}
+    with open(USAGE_FILE, 'r') as f:
+        return json.load(f)
+
+def save_usage(usage):
+    with open(USAGE_FILE, 'w') as f:
+        json.dump(usage, f)
+
 def generate_unique_key(existing_keys):
     while True:
         new_key = str(uuid.uuid4())
         if new_key not in existing_keys:
             return new_key
 
+def cleanup_usage(usage):
+    # Remove usage entries older than today for cleanup
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    keys_to_delete = []
+    for user_ip, data in usage.items():
+        # data: {"date": "YYYY-MM-DD", "count": int}
+        if data.get("date") != today_str:
+            keys_to_delete.append(user_ip)
+    for key in keys_to_delete:
+        del usage[key]
+
 @app.route("/genkey")
 def generate_key():
+    user_ip = request.remote_addr
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    usage = load_usage()
+    cleanup_usage(usage)
+
+    user_data = usage.get(user_ip)
+    if user_data and user_data.get("date") == today_str and user_data.get("count", 0) >= 3:
+        # User exceeded 3 keys today
+        return render_template("error.html", message="You have reached the maximum of 3 keys per day."), 403
+
+    # Load keys and generate new key
     keys = load_keys()
     new_key = generate_unique_key(keys)
     expiration = (datetime.now() + timedelta(hours=24)).isoformat()
 
     keys[new_key] = {"expires": expiration, "used": False}
     save_keys(keys)
+
+    # Update usage
+    if user_data and user_data.get("date") == today_str:
+        usage[user_ip]["count"] += 1
+    else:
+        usage[user_ip] = {"date": today_str, "count": 1}
+    save_usage(usage)
 
     encrypted_key = cipher.encrypt(new_key.encode()).decode()
     return render_template("keygen.html", key=encrypted_key, expires=expiration)
@@ -43,6 +84,8 @@ def generate_key():
 def verify_key():
     encrypted_key = request.args.get("key")
     if not encrypted_key:
+        # Instead of returning JSON error, you can return a user-friendly HTML or JSON message
+        # Here we choose JSON with error so the client can handle it properly
         return jsonify({"valid": False, "reason": "No key provided"}), 400
 
     try:
